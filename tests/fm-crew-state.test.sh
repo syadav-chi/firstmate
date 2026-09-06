@@ -25,6 +25,9 @@
 #       This is the direct regression pair for the 2026-07-02 herdr incident,
 #       proving the watcher's own absorb-only-when-provably-working predicate
 #       benefits from the fix in both directions.
+#   (l) terminal run-step + busy pane -> working via pane (a busy pane means the
+#       crew is still working, so the absorb decision keeps absorbing); an idle
+#       pane keeps the terminal run-step.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -682,6 +685,64 @@ test_terminal_failed() {
   assert_contains "$out" "state: failed" "failed run -> failed"
   assert_contains "$out" "source: run-step" "failed -> run-step source"
   pass "terminal failed run is authoritative"
+}
+
+# (l) a terminal run-step never outranks a provably busy pane: the crew kept
+# working after its pipeline finished, so the absorb decision must keep
+# absorbing its turn-ended wakes instead of surfacing every one.
+test_terminal_passed_busy_pane_reports_working() {
+  reset_fakes
+  local d; d=$(new_case passed-busy)
+  make_repo_on_branch "$d/wt" fm/feat-pb
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-pb.meta" "window=fm:fm-feat-pb" "worktree=$d/wt" "kind=ship" "harness=claude"
+  FM_FAKE_AXI_STATUS="$(run_passed fm/feat-pb)"
+  FM_FAKE_BUSY=1
+  local gen; gen=$("$ROOT/bin/fm-busy-event.sh" arm "$d/state" feat-pb)
+  "$ROOT/bin/fm-busy-event.sh" apply "$d/state" feat-pb busy --gen "$gen" \
+    --source claude-hook --event user-prompt-submit
+  local out; out=$(run_crew_state "$d" feat-pb)
+  assert_contains "$out" "state: working" "terminal run + busy pane -> working"
+  assert_contains "$out" "source: pane" "busy pane outranks the terminal run-step"
+  PATH="$d/fakebin:$PATH" FM_STATE_OVERRIDE="$d/state" crew_is_provably_working feat-pb \
+    || fail "terminal run + busy pane was not treated as provably working"
+  pass "terminal passed run + busy pane absorbs"
+}
+
+test_terminal_failed_busy_pane_reports_working() {
+  reset_fakes
+  local d; d=$(new_case failed-busy)
+  make_repo_on_branch "$d/wt" fm/feat-fb
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-fb.meta" "window=fm:fm-feat-fb" "worktree=$d/wt" "kind=ship" "harness=claude"
+  FM_FAKE_AXI_STATUS="$(run_failed fm/feat-fb)"
+  FM_FAKE_BUSY=1
+  local gen; gen=$("$ROOT/bin/fm-busy-event.sh" arm "$d/state" feat-fb)
+  "$ROOT/bin/fm-busy-event.sh" apply "$d/state" feat-fb busy --gen "$gen" \
+    --source claude-hook --event user-prompt-submit
+  local out; out=$(run_crew_state "$d" feat-fb)
+  assert_contains "$out" "state: working" "failed run + busy pane -> working"
+  assert_contains "$out" "source: pane" "busy pane outranks the terminal failed run-step"
+  PATH="$d/fakebin:$PATH" FM_STATE_OVERRIDE="$d/state" crew_is_provably_working feat-fb \
+    || fail "terminal failed run + busy pane was not treated as provably working"
+  pass "terminal failed run + busy pane absorbs"
+}
+
+test_terminal_passed_idle_pane_stays_done() {
+  reset_fakes
+  local d; d=$(new_case passed-idle)
+  make_repo_on_branch "$d/wt" fm/feat-pi
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-pi.meta" "window=fm:fm-feat-pi" "worktree=$d/wt" "kind=ship" "harness=claude"
+  FM_FAKE_AXI_STATUS="$(run_passed fm/feat-pi)"
+  FM_FAKE_BUSY=0
+  arm_idle_record "$d/state" feat-pi
+  local out; out=$(run_crew_state "$d" feat-pi)
+  assert_contains "$out" "state: done" "terminal run + idle pane stays done"
+  assert_contains "$out" "source: run-step" "idle pane keeps the terminal run-step"
+  PATH="$d/fakebin:$PATH" FM_STATE_OVERRIDE="$d/state" crew_is_provably_working feat-pi \
+    && fail "terminal run + idle pane was treated as provably working"
+  pass "terminal passed run + idle pane still surfaces"
 }
 
 # (e) cross-branch attribution: `axi status` returns ANOTHER branch's run (the
@@ -1428,6 +1489,9 @@ test_top_level_fixing_ci_running_after_green_stays_working
 test_top_level_fixing_done_log_stays_working
 test_terminal_passed
 test_terminal_failed
+test_terminal_passed_busy_pane_reports_working
+test_terminal_failed_busy_pane_reports_working
+test_terminal_passed_idle_pane_stays_done
 test_cross_branch_attribution_via_runs_list
 test_cross_branch_attribution_picks_most_recent_row
 test_coarse_run_does_not_probe_other_branch_ci_log_for_ready_status

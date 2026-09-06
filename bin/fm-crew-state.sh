@@ -37,8 +37,12 @@
 #      diverged from it, invalidates attribution.
 #      The run-step is AUTHORITATIVE: running/fixing -> working, ci -> working,
 #      awaiting_approval/fix_review -> parked (with gate findings), terminal
-#      passed/checks-passed -> done, failed/cancelled -> failed. EXCEPT: while
-#      the active step is ci, `axi status` alone cannot tell "still waiting on
+#      passed/checks-passed -> done, failed/cancelled -> failed. EXCEPT: a terminal
+#      run-step never outranks a provably busy pane - a busy pane means the crew is
+#      still working (e.g. correcting code after its pipeline finished), so a
+#      terminal run with a busy pane reports working via pane instead of done/failed
+#      via run-step, and the absorb decision keeps absorbing its turn-ended wakes.
+#      While the active step is ci, `axi status` alone cannot tell "still waiting on
 #      checks" from "checks green, waiting on merge" (see nm_ci_checks_state) -
 #      a ci-step log-tail check overrides working -> done once checks read
 #      green, so a green PR is never silently read as still-validating.
@@ -187,7 +191,8 @@ if [ -n "$REMOTE_HOST" ]; then
   esac
 fi
 
-# pane_readable is consulted ONLY in the no-run fallback below. The run-step path
+# pane_readable is consulted ONLY in the no-run fallback below, plus the one
+# terminal-run busy-pane override in the run-step path. The run-step path otherwise
 # stays authoritative regardless of pane liveness - judge by the run-step, not the
 # shell - so a finished crew whose endpoint has closed still reports its run-step
 # state (e.g. done) instead of being masked as unknown. Backend-aware
@@ -573,6 +578,23 @@ if [ "$HAVE_RUN" = 1 ]; then
         else
           RUN_DETAIL="$RUN_DETAIL${SEP}status-log superseded (run $RUN_STATE)"
         fi
+      fi
+      ;;
+  esac
+  # A terminal run-step never outranks a provably busy pane: a busy pane means the
+  # crew is still working (e.g. correcting code after its pipeline finished), so
+  # report working via pane and let the absorb decision keep absorbing its
+  # turn-ended wakes. Only an exact busy verdict overrides - an idle or
+  # unavailable pane keeps the terminal run-step, so a finished crew whose
+  # endpoint closed still reports done/failed. Parked runs are untouched: a gate
+  # still needs its decision surfaced.
+  case "$RUN_STATE" in
+    done|failed)
+      if [ -n "$BACKEND_TARGET" ] && pane_readable "$BACKEND_TARGET"; then
+        BUSY_VERDICT=$(crew_busy_verdict "$BACKEND_TARGET")
+        case "${BUSY_VERDICT%% *}" in
+          busy) emit working pane "harness busy (${BUSY_VERDICT#* })${SEP}terminal run $RUN_STATE superseded: $RUN_DETAIL" ;;
+        esac
       fi
       ;;
   esac
