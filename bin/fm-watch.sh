@@ -209,10 +209,11 @@ fi
 # turn-ended signature, annotation staleness checks, and guarded bookkeeping writes.
 
 POLL=${FM_POLL:-15}                   # seconds between cycles
-# The liveness beacon is touched once per cycle, immediately before the
-# terminal wait below (event_wait_or_sleep) as well as at the top of the next
-# one, so a healthy cycle's beacon can legitimately age up to POLL seconds
-# between touches. fm_poll_derived_grace (bin/fm-wake-lib.sh, already sourced
+# The liveness beacon is touched at the top of each cycle and before every
+# task's stale-pane scan. A slow fleet scan therefore proves progress between
+# tasks, while one indefinitely wedged task still lets the beacon age out.
+# The terminal wait alone can add up to POLL seconds to that age.
+# fm_poll_derived_grace (bin/fm-wake-lib.sh, already sourced
 # transitively above) is the single owner of the max(300, poll+60)
 # derivation - see docs/turnend-guard.md "Guard grace and the poll cadence".
 # This recomputes the library default above now that the real configured
@@ -2366,6 +2367,12 @@ EOF
   # remembers the hash already classified, or the declaration a busy pane's
   # crossed turn bound already handed to the away-mode daemon).
   while IFS= read -r w; do
+    # Keep the guard's liveness proof aligned with progress through a slow fleet
+    # scan. A task-state or pane read may take tens of seconds on a saturated
+    # host, so waiting for the next cycle beacon can falsely declare this live
+    # watcher down. Touch before each task's expensive reads; if one read wedges
+    # indefinitely, no later task touch masks that failure.
+    touch "$STATE/.last-watcher-beat"
     kind=$(window_kind "$w")
     task=$(window_to_task "$w" "$STATE")
     # Steering-inbox loss detection runs before the secondmate stale
