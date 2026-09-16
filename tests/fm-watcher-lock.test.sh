@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # tests/fm-watcher-lock.test.sh - watcher singleton + lock-primitive races +
-# PID identity stability + watch-arm liveness + guard warnings. These are
-# safety-critical process invariants (a race bug may not reproduce through an
-# e2e), so they stay as focused real-process units.
+# PID identity stability + watch-arm liveness + progress beacons + guard
+# warnings. These are safety-critical process invariants (a race bug may not
+# reproduce through an e2e), so they stay as focused real-process units.
 set -u
 
 # shellcheck source=tests/wake-helpers.sh
@@ -192,6 +192,99 @@ test_guard_warnings() {
   wait "$pid" 2>/dev/null || true
   [ ! -s "$err" ] || fail "guard warned with a live watcher and fresh beacon: $(cat "$err")"
   pass "guard banner leads when down with pending wakes (repair-after-drain) and stays silent when live and fresh"
+}
+
+test_slow_fleet_scan_refreshes_beacon_between_tasks() {
+  local dir state fakebin out guard_err pid i
+  dir=$(make_case slow-fleet-scan)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/watch.out"
+  guard_err="$dir/guard.err"
+
+  cat > "$fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+set -u
+wait_for_release() {
+  release=$1
+  ticks=0
+  while [ ! -e "$release" ] && [ "$ticks" -lt 200 ]; do
+    sleep 0.05
+    ticks=$((ticks + 1))
+  done
+  [ -e "$release" ]
+}
+if [ "${1:-}" = capture-pane ]; then
+  target=
+  shift
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -t) target=${2:-}; shift 2; continue ;;
+    esac
+    shift
+  done
+  case "$target" in
+    test:fm-first)
+      touch "$FM_FAKE_FIRST_ENTERED"
+      wait_for_release "$FM_FAKE_FIRST_RELEASE" || exit 1
+      ;;
+    test:fm-second)
+      touch "$FM_FAKE_SECOND_ENTERED"
+      wait_for_release "$FM_FAKE_SECOND_RELEASE" || exit 1
+      ;;
+  esac
+  printf 'idle pane\n'
+  exit 0
+fi
+if [ "${1:-}" = display-message ]; then
+  printf 'zsh\n'
+  exit 0
+fi
+exit 1
+SH
+  chmod +x "$fakebin/tmux"
+  printf 'window=test:fm-first\nkind=ship\nbackend=tmux\n' > "$state/first.meta"
+  printf 'window=test:fm-second\nkind=ship\nbackend=tmux\n' > "$state/second.meta"
+
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_STATE_OVERRIDE="$state" \
+    FM_FAKE_FIRST_ENTERED="$dir/first-entered" \
+    FM_FAKE_FIRST_RELEASE="$dir/first-release" \
+    FM_FAKE_SECOND_ENTERED="$dir/second-entered" \
+    FM_FAKE_SECOND_RELEASE="$dir/second-release" \
+    FM_POLL=999999 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
+    FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+
+  i=0
+  while [ "$i" -lt 200 ] && [ ! -e "$dir/first-entered" ]; do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.05
+    i=$((i + 1))
+  done
+  [ -e "$dir/first-entered" ] \
+    || { kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; fail "watcher never entered the first task scan: $(cat "$out")"; }
+
+  touch -t 200001010000 "$state/.last-watcher-beat"
+  touch "$dir/first-release"
+  i=0
+  while [ "$i" -lt 200 ] && [ ! -e "$dir/second-entered" ]; do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.05
+    i=$((i + 1))
+  done
+  [ -e "$dir/second-entered" ] \
+    || { kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; fail "watcher never advanced to the second task scan: $(cat "$out")"; }
+
+  FM_HOME="$dir" FM_ROOT_OVERRIDE="$dir" FM_STATE_OVERRIDE="$state" \
+    FM_SUPERVISION_MODEL=persistent FM_GUARD_GRACE=300 \
+    "$ROOT/bin/fm-guard.sh" >/dev/null 2> "$guard_err" \
+    || { touch "$dir/second-release"; kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; fail "guard failed during the progressing scan"; }
+  touch "$dir/second-release"
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  [ ! -s "$guard_err" ] \
+    || fail "guard misread a watcher progressing between slow task scans as down: $(cat "$guard_err")"
+  pass "a slow fleet scan refreshes the watcher beacon between tasks"
 }
 
 test_lock_single_winner_under_concurrency() {
@@ -1116,6 +1209,7 @@ test_stale_watch_lock_reclaimed
 test_stale_watch_reclaim_publishes_before_clear
 test_live_stale_watch_lock_is_actionable
 test_guard_warnings
+test_slow_fleet_scan_refreshes_beacon_between_tasks
 test_lock_single_winner_under_concurrency
 test_lock_steals_dead_pid_lock
 test_lock_stale_steal_single_winner_under_concurrency
