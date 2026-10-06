@@ -1,0 +1,89 @@
+Live drive of the /upload skill (branch fm/upload-skill, commits c910d70 + ec8cd06) against
+lavish-axi 0.1.79, a real headless Chrome, and a disposable lab home. The primary was
+never touched; both labs were torn down in the same turn.
+
+1. OPEN + ARM (real product command)
+   $ FM_HOME=$LAB bin/fm-upload.sh open --purpose "Gate lab: send the homework notebook and the photo set"
+   session: file: $LAB/.lavish/upload.html
+            url: "http://srv1839937.tail0a571c.ts.net:4387/session/a2ba8cd1d769e69d"   (plain http on the tailnet host)
+            status: opened
+   registered: lavish-a2ba8cd1d769e69d (lavish)
+   armed: lavish-a2ba8cd1d769e69d
+
+2. UNFILTERED PICKER (.ipynb bug)
+   Real Chrome (430x932 phone viewport) loaded the session URL; the artifact's file input
+   was queried at runtime: accept attribute = null (no accept filter). homework.ipynb was
+   picked and shown in the list. Screenshot: upload-picked-homework.png
+
+3. SINGLE-ROUND UPLOAD, byte-for-byte
+   Clicked the page's own Send in the sandboxed artifact (page JS ran its plain-JS
+   SHA-256, no crypto.subtle over plain http). The armed listener captured a real result
+   (state/procevent-inbox/lavish-*.1.result):
+     "File upload batch muwxcwufbwpgdb, send 1 of 1 (1 file(s): homework.ipynb).
+      FMUPLOAD1 batch=muwxcwufbwpgdb file=homework.ipynb index=1 count=1 part=1 parts=1
+      bytes=58 sha256=ce65c2f4... ::eyJjZWxscyI6...::END"
+   $ FM_HOME=$LAB bin/fm-upload.sh receive <captured result>
+     saved: $LAB/data/uploads/homework.ipynb bytes=58 sha256=ce65c2f4ffc92bc8f49e73ccdb5930b62bb014d1c70b33f66318bb97c228b39e
+     parts=1 saved=1 waiting=0 rejected=0 truncated=0
+   cmp source landed-file -> BYTE-FOR-BYTE IDENTICAL
+
+4. THREE-ROUND UPLOAD + DELIBERATE OVERFLOW (merge + 1 MiB bound)
+   Picked big-photos.tar (1,200,000 bytes -> page plans 3 rounds; per-round buttons render:
+   "Send part 2 of 3", "Send part 3 of 3"). Two rounds queued before the listener restart
+   merged into ONE capture bounded at exactly 1048576 bytes:
+   $ wc -c < ...2.result  -> 1048576
+   $ FM_HOME=$LAB bin/fm-upload.sh receive ...2.result
+     waiting: batch=muwxnml3q3ifwh file=big-photos.tar have=1/3 missing=2,3
+     truncated: 1 part(s) cut off before their end marker
+     parts=1 saved=0 waiting=1 rejected=0 truncated=1     (exit 0; nothing corrupt landed)
+   Then the page's own per-round Resend buttons were pressed round by round
+   (confirm-then-send pacing):
+     ...4.result (704460 bytes): waiting: ... have=2/3 missing=3 / parts=1 truncated=0
+     ...5.result (204460 bytes): saved: $LAB/data/uploads/big-photos.tar bytes=1200000
+                                 sha256=b5499bddcdbd4a8d744e646a61de9c46551f4f0635fa065fc2ae725c315c2c37
+   cmp source landed-file -> BYTE-FOR-BYTE IDENTICAL; staged state/uploads/ cleaned after landing.
+
+5. MARKER-NAMED FILE (F2 regression, live through the page)
+   A file literally named "FMUPLOAD1 bait.txt" was picked and sent. The page header carried
+   it as "FMUPLOAD-1 bait.txt" (sanitized) and receive counted only full "FMUPLOAD1 batch="
+   marker starts:
+   $ FM_HOME=$LAB bin/fm-upload.sh receive ...6.result
+     saved: $LAB/data/uploads/FMUPLOAD1 bait.txt bytes=26 ...
+     parts=1 saved=1 waiting=0 rejected=0 truncated=0      <- no false truncated line
+   Pre-fix binary (c910d70's fm-upload.py) on the SAME real captured result:
+     already-saved: ... ; truncated: 5 part(s) cut off before their end marker   <- the reported bug
+
+6. MALFORMED HAND-TYPED HEADERS (F1 regression, live through the real command)
+   '٣' (Arabic-Indic digit) in parts=:  pre-fix silently int()'d it as 3 ("waiting ... have=1/3");
+     current: rejected: batch=hand1 file=x.txt part=1 reason=malformed-header, exit 1.
+   '²' (superscript two) in bytes=:     pre-fix: ValueError: invalid literal for int() with base 10: '²'
+     (traceback); current: rejected: ... reason=malformed-header, exit 1.
+
+7. NO-OVERWRITE + IDENTICAL RESEND
+   $ FM_HOME=$LAB bin/fm-upload.sh receive ...1.result        (identical bytes already landed)
+     already-saved: $LAB/data/uploads/homework.ipynb sha256=ce65c2f4... (no -1 copy created)
+   Different bytes onto an existing name (captured marker replayed with --dest):
+     saved: $LAB/data/dest2/note-1.ipynb bytes=26 ...          (original untouched: "captain original")
+
+8. FILE-NAME CONFINEMENT (crafted adversarial header)
+   file=../../x/evil%20%26%20.hidden -> saved: $LAB/data/dest2/"evil & .hidden"; nothing outside the destination.
+
+9. CLIENT-SIDE PHOTO SHRINK (live through the page)
+   An 8.24 MB 2400x1200 PNG was picked with the shrink checkbox default-on ("8.24 MB ·
+   will be shrunk"). One Send: the page re-encoded it client-side and one part fit the
+   budget. Receive:
+     saved: $LAB/data/uploads/big-photo.jpg bytes=97420 sha256=c4dfe766...
+   file(1): "JPEG image data ... precision 8, 2000x1000"  <- 2400px longest side shrunk to 2000, .jpg name
+   Screenshots: upload-photo-shrink-picked.png, upload-photo-shrink-sent.png
+
+10. RECEIVE BOUNDARY LINES
+   Empty capture -> parts=0 ... exit 3 (handled as ordinary Lavish feedback per SKILL.md).
+
+11. LIFECYCLE CLOSE (SKILL.md steps)
+   $ FM_HOME=$LAB bin/fm-procevent.sh retire "$(source id)"  -> retired
+   $ lavish-axi end "$LAB/.lavish/upload.html"               -> status: ended
+   Labs rm -rf'd; no default-session or fleet state touched.
+
+Also run: bash tests/fm-upload.test.sh -> all 9 assertions ok (multi-part reassembly,
+corrupt-part rejection, overwrite/duplicate, name escape, truncated merge, unicode digits,
+marker-named file, no-upload exit 3).
