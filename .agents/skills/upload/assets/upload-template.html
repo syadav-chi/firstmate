@@ -175,10 +175,11 @@
   }
 
   function sendOne(k) {
-    const note = $('note').value.trim();
-    const names = picked.map(p => p.file.name).join(', ');
+    const noMarker = s => s.replace(/FMUPLOAD1/g, 'FMUPLOAD-1');
+    const note = noMarker($('note').value.trim());
+    const names = picked.map(p => noMarker(p.file.name)).join(', ');
     const header = `File upload batch ${batch}, send ${k + 1} of ${sends.length} (${picked.length} file(s): ${names}).` +
-      (note ? `\nNote: ${note.replace(/FMUPLOAD1/g, 'FMUPLOAD-1')}` : '') +
+      (note ? `\nNote: ${note}` : '') +
       `\nReceive with bin/fm-upload.sh receive.`;
     window.lavish.queuePrompt(header + '\n' + sends[k].join('\n'), {
       tag: 'file-upload',

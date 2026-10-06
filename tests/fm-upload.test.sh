@@ -125,6 +125,28 @@ test_cut_off_part_is_reported_and_ignored() {
   pass "a part cut off by the capture bound is reported and ignored"
 }
 
+test_unicode_digit_header_fields_are_rejected() {
+  local home out rc=0
+  home=$(new_home unicode)
+  out=$(printf 'FMUPLOAD1 batch=b7 file=x.txt index=1 count=1 part=1 parts=%s bytes=2 sha256=%s psha=%s ::%s::END\n' \
+      '٣' "$(printf hi | sha256sum | cut -d' ' -f1)" "$(printf hi | sha256sum | cut -d' ' -f1)" "$(printf hi | base64)" \
+      | FM_HOME="$home" "$UPLOAD" receive -) || rc=$?
+  expect_code 1 "$rc" "non-ASCII digit in a numeric field"
+  assert_contains "$out" "rejected: batch=b7 file=x.txt part=1 reason=malformed-header" "the part is rejected, not crashed on"
+  pass "non-ASCII digit header fields are rejected cleanly"
+}
+
+test_marker_like_file_name_does_not_fake_truncation() {
+  local home src out
+  home=$(new_home markername)
+  src="$TMP_ROOT/FMUPLOAD1 bait.txt"
+  printf 'bait\n' > "$src"
+  out=$(make_parts "$src" "FMUPLOAD1 bait.txt" 1 b8 | FM_HOME="$home" "$UPLOAD" receive -)
+  assert_contains "$out" "saved: $home/data/uploads/FMUPLOAD1 bait.txt" "the file is landed"
+  assert_contains "$out" "truncated=0" "no false truncated report"
+  pass "a marker-shaped file name cannot fake a truncated part"
+}
+
 test_result_without_upload_exits_3() {
   local home rc=0
   home=$(new_home none)
@@ -139,4 +161,6 @@ test_corrupt_part_is_rejected_and_not_landed
 test_never_overwrites_and_recognizes_duplicates
 test_file_names_cannot_escape_the_destination
 test_cut_off_part_is_reported_and_ignored
+test_unicode_digit_header_fields_are_rejected
+test_marker_like_file_name_does_not_fake_truncation
 test_result_without_upload_exits_3

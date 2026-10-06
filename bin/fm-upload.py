@@ -80,7 +80,8 @@ def receive(staging, dest, text):
         label = f"batch={fields.get('batch', '?')} file={fields.get('file', '?')} part={fields.get('part', '?')}"
         if any(k not in fields for k in REQUIRED) or not SAFE_ID.match(fields['batch']) \
                 or not HEX64.match(fields['sha256']) or not HEX64.match(fields['psha']) \
-                or not all(fields[k].isdigit() for k in ('index', 'count', 'part', 'parts', 'bytes')):
+                or not all(fields[k].isdigit() and fields[k].isascii()
+                           for k in ('index', 'count', 'part', 'parts', 'bytes')):
             out.append(f'rejected: {label} reason=malformed-header')
             rejected += 1
             continue
@@ -136,7 +137,7 @@ def receive(staging, dest, text):
             os.rmdir(os.path.dirname(fdir))
         except OSError:
             pass
-    truncated = max(0, text.count('FMUPLOAD1 ') - found)
+    truncated = max(0, text.count('FMUPLOAD1 batch=') - found)
     if truncated:
         out.append(f'truncated: {truncated} part(s) cut off before their end marker')
     out.append(f'parts={found} saved={saved} waiting={waiting} rejected={rejected} truncated={truncated}')
