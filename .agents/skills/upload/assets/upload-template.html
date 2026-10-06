@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="en" data-theme="luxury">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Send Files to Firstmate</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/daisyui@5.5.19/daisyui.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/daisyui@5.5.19/themes.css">
+<script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4.2.4/dist/index.global.js"></script>
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+  :where(.grid, .flex) > * { min-width: 0; }
+  :where(p, h1, h2, li, .badge) { overflow-wrap: anywhere; }
+  body { background: var(--color-base-100); color: var(--color-base-content); }
+  .drop { border: 2px dashed color-mix(in oklab, var(--color-base-content) 30%, transparent); }
+  .drop.over { border-color: var(--color-primary); background: color-mix(in oklab, var(--color-primary) 12%, transparent); }
+  /* Visually hidden but still a real, focusable control: some pickers and test drivers ignore display:none inputs. */
+  .pick { position: absolute; width: 1px; height: 1px; opacity: 0; overflow: hidden; }
+</style>
+</head>
+<body class="min-h-screen">
+<main class="max-w-2xl mx-auto px-4 py-6 space-y-5">
+  <header class="space-y-1">
+    <h1 class="text-2xl font-bold">Send files to firstmate</h1>
+    <p class="opacity-80" id="purpose"></p>
+  </header>
+
+  <label class="drop rounded-box p-8 text-center cursor-pointer block bg-base-200 relative">
+    <input type="file" multiple class="pick" id="file" aria-label="Choose files">
+    <span class="btn btn-primary btn-lg pointer-events-none">Choose files</span>
+    <span class="block text-sm opacity-70 mt-2">or drop them here · any file type</span>
+  </label>
+
+  <div id="err" class="alert alert-error hidden" role="alert"></div>
+
+  <section id="list" class="card bg-base-200 hidden">
+    <div class="card-body gap-3 p-4">
+      <ul id="files" class="divide-y divide-base-300"></ul>
+      <label class="flex items-center gap-2 text-sm hidden" id="shrinkRow">
+        <input type="checkbox" class="checkbox checkbox-sm" id="shrink" checked>
+        <span>Shrink large photos (longest side 2000 px) so they send in one go</span>
+      </label>
+      <label class="form-control">
+        <span class="text-xs opacity-70">Note for firstmate (optional)</span>
+        <textarea class="textarea w-full" id="note" rows="2" placeholder="What these are, where they belong, what to do next"></textarea>
+      </label>
+      <p class="text-sm opacity-80" id="plan"></p>
+      <button type="button" class="btn btn-primary btn-lg w-full" id="send" disabled>Send</button>
+      <div id="rounds" class="flex flex-wrap gap-2"></div>
+      <p class="text-sm" id="sent" role="status" aria-live="polite"></p>
+    </div>
+  </section>
+  <span id="fm-upload-anchor" hidden></span>
+</main>
+
+<script>
+  // Wire contract with bin/fm-upload.py: each queued prompt carries one or more
+  // lines "FMUPLOAD1 <key=value ...> ::<base64>::END". Values are
+  // percent-encoded and base64 never needs escaping, so the marker survives
+  // whatever quoting the Lavish poll output applies around it.
+  const PURPOSE = "__FM_UPLOAD_PURPOSE__";
+  // base64 chars per send. Firstmate's listener restarts only once per supervision cycle, so every
+  // send made before that restart lands in ONE captured result bounded at 1 MiB: one send per round
+  // stays under it, and the captain waits for firstmate's confirmation before sending the next round.
+  const SEND_BUDGET = 700000;
+  const PART_RAW = SEND_BUDGET / 4 * 3;  // raw bytes per part
+  const SHRINK_EDGE = 2000;
+
+  const $ = id => document.getElementById(id);
+  const esc = s => String(s).replace(/[&<>"]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch]));
+  const size = n => n < 1024 ? n + ' B' : n < 1048576 ? (n / 1024).toFixed(1) + ' KB' : (n / 1048576).toFixed(2) + ' MB';
+  $('purpose').textContent = PURPOSE.startsWith('__') ? 'Pick files on this device and press Send. They arrive byte-for-byte, checked with a fingerprint.' : PURPOSE;
+
+  let picked = [];       // { file, shrunk? }
+  let sends = null;      // prepared sends: [[partLine, ...], ...]
+  const sentRounds = new Set();
+  const batch = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+
+  // Plain-JS SHA-256, because crypto.subtle is missing on the plain-http address Lavish is served from.
+  function sha256(bytes) {
+    const K = new Uint32Array([0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2]);
+    const H = new Uint32Array([0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19]);
+    const len = bytes.length, total = Math.ceil((len + 9) / 64) * 64;
+    const msg = new Uint8Array(total);
+    msg.set(bytes); msg[len] = 0x80;
+    const dv = new DataView(msg.buffer);
+    dv.setUint32(total - 8, Math.floor(len / 0x20000000)); dv.setUint32(total - 4, (len * 8) >>> 0);
+    const W = new Uint32Array(64), r = (x, n) => (x >>> n) | (x << (32 - n));
+    for (let o = 0; o < total; o += 64) {
+      for (let t = 0; t < 16; t++) W[t] = dv.getUint32(o + t * 4);
+      for (let t = 16; t < 64; t++) W[t] = (W[t-16] + (r(W[t-15], 7) ^ r(W[t-15], 18) ^ (W[t-15] >>> 3)) + W[t-7] + (r(W[t-2], 17) ^ r(W[t-2], 19) ^ (W[t-2] >>> 10))) >>> 0;
+      let [a, b, c, d, e, f, g, h] = H;
+      for (let t = 0; t < 64; t++) {
+        const t1 = (h + (r(e, 6) ^ r(e, 11) ^ r(e, 25)) + ((e & f) ^ (~e & g)) + K[t] + W[t]) >>> 0;
+        const t2 = ((r(a, 2) ^ r(a, 13) ^ r(a, 22)) + ((a & b) ^ (a & c) ^ (b & c))) >>> 0;
+        h = g; g = f; f = e; e = (d + t1) >>> 0; d = c; c = b; b = a; a = (t1 + t2) >>> 0;
+      }
+      H[0] += a; H[1] += b; H[2] += c; H[3] += d; H[4] += e; H[5] += f; H[6] += g; H[7] += h;
+    }
+    return [...H].map(x => x.toString(16).padStart(8, '0')).join('');
+  }
+
+  function b64(bytes) {
+    let s = '';
+    for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    return btoa(s);
+  }
+
+  const shrinkable = f => /^image\/(jpeg|png|webp|heic|heif)$/i.test(f.type) && f.size > PART_RAW;
+
+  async function shrink(file) {
+    const bmp = await createImageBitmap(file);
+    const k = Math.min(1, SHRINK_EDGE / Math.max(bmp.width, bmp.height));
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.round(bmp.width * k); canvas.height = Math.round(bmp.height * k);
+    canvas.getContext('2d').drawImage(bmp, 0, 0, canvas.width, canvas.height);
+    const blob = await new Promise(res => canvas.toBlob(res, 'image/jpeg', 0.85));
+    if (!blob) throw new Error('this browser could not re-encode the photo');
+    const name = file.name.replace(/\.[^.]+$/, '') + '.jpg';
+    return new File([blob], name, { type: 'image/jpeg' });
+  }
+
+  function showError(msg) { $('err').textContent = msg; $('err').classList.toggle('hidden', !msg); }
+
+  function render() {
+    $('list').classList.toggle('hidden', !picked.length);
+    $('files').innerHTML = picked.map((p, i) => `
+      <li class="flex items-center justify-between gap-2 py-2">
+        <div class="min-w-0"><div class="font-medium truncate" title="${esc(p.file.name)}">${esc(p.file.name)}</div>
+        <div class="text-xs opacity-70">${size(p.file.size)}${shrinkable(p.file) && $('shrink').checked ? ' · will be shrunk' : ''}</div></div>
+        <button type="button" class="btn btn-ghost btn-sm" data-remove="${i}" aria-label="Remove ${esc(p.file.name)}" ${sends ? 'disabled' : ''}>✕</button>
+      </li>`).join('');
+    $('shrinkRow').classList.toggle('hidden', !picked.some(p => shrinkable(p.file)));
+    document.querySelectorAll('[data-remove]').forEach(b => b.onclick = () => { picked.splice(+b.dataset.remove, 1); render(); });
+    if (!sends) {
+      const est = picked.reduce((n, p) => n + Math.max(1, Math.ceil((shrinkable(p.file) && $('shrink').checked ? PART_RAW : p.file.size) / PART_RAW)), 0);
+      $('plan').textContent = picked.length > 0 && est > 1 ? `This is large enough to go in about ${est} parts. Send part 1, then send each next part after firstmate confirms the previous one.` : '';
+      $('send').textContent = 'Send';
+      $('send').disabled = !picked.length;
+    }
+  }
+
+  function addFiles(list) {
+    showError('');
+    if (sends) { showError('Finish this send first, or reload the page to start over.'); return; }
+    for (const file of list) if (!picked.some(p => p.file.name === file.name && p.file.size === file.size)) picked.push({ file });
+    render();
+  }
+
+  async function prepare() {
+    const lines = [];
+    const count = picked.length;
+    for (let i = 0; i < count; i++) {
+      let file = picked[i].file;
+      if (shrinkable(file) && $('shrink').checked) file = await shrink(file);
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      const whole = sha256(bytes);
+      const parts = Math.max(1, Math.ceil(bytes.length / PART_RAW));
+      for (let p = 0; p < parts; p++) {
+        const chunk = bytes.subarray(p * PART_RAW, (p + 1) * PART_RAW);
+        const fields = { batch, file: file.name, index: i + 1, count, part: p + 1, parts, bytes: bytes.length, sha256: whole, psha: sha256(chunk) };
+        const head = Object.entries(fields).map(([k, v]) => k + '=' + encodeURIComponent(String(v))).join(' ');
+        lines.push(`FMUPLOAD1 ${head} ::${b64(chunk)}::END`);
+      }
+    }
+    // Pack lines into sends without crossing the budget.
+    const out = [];
+    let cur = [], used = 0;
+    for (const line of lines) {
+      if (cur.length && used + line.length > SEND_BUDGET + 2000) { out.push(cur); cur = []; used = 0; }
+      cur.push(line); used += line.length;
+    }
+    if (cur.length) out.push(cur);
+    return out;
+  }
+
+  function sendOne(k) {
+    const note = $('note').value.trim();
+    const names = picked.map(p => p.file.name).join(', ');
+    const header = `File upload batch ${batch}, send ${k + 1} of ${sends.length} (${picked.length} file(s): ${names}).` +
+      (note ? `\nNote: ${note.replace(/FMUPLOAD1/g, 'FMUPLOAD-1')}` : '') +
+      `\nReceive with bin/fm-upload.sh receive.`;
+    window.lavish.queuePrompt(header + '\n' + sends[k].join('\n'), {
+      tag: 'file-upload',
+      text: `Upload ${k + 1}/${sends.length}: ${names}`,
+      queueKey: `fm-upload-${batch}-${k}`,
+      element: $('fm-upload-anchor'),
+    });
+    window.lavish.sendQueuedPrompts?.();
+  }
+
+  function renderRounds() {
+    const n = sends ? sends.length : 0;
+    $('send').classList.toggle('hidden', n > 1);
+    $('rounds').innerHTML = n > 1 ? sends.map((_, k) =>
+      `<button type="button" class="btn ${sentRounds.has(k) ? 'btn-outline' : 'btn-primary'} flex-1" data-round="${k}">${sentRounds.has(k) ? 'Resend' : 'Send'} part ${k + 1} of ${n}</button>`).join('') : '';
+    document.querySelectorAll('[data-round]').forEach(b => b.onclick = () => sendRound(+b.dataset.round));
+  }
+
+  function sendRound(k) {
+    sendOne(k);
+    sentRounds.add(k);
+    const n = sends.length;
+    if (n === 1) {
+      $('send').textContent = 'Sent';
+      $('sent').textContent = `Sent ${picked.length} file(s). Firstmate will confirm once each file's fingerprint checks out. Reload the page to send more.`;
+    } else {
+      $('sent').textContent = sentRounds.size === n
+        ? `All ${n} parts sent. Firstmate will confirm once each file's fingerprint checks out; resend any part it reports missing.`
+        : `Sent part ${k + 1} of ${n}. Wait for firstmate to confirm it before sending the next part.`;
+    }
+    renderRounds();
+  }
+
+  $('send').onclick = async () => {
+    showError('');
+    if (!window.lavish?.queuePrompt) { showError('Open this page through the Lavish link firstmate gave you to send.'); return; }
+    const btn = $('send');
+    btn.disabled = true;
+    try {
+      btn.textContent = 'Preparing…';
+      sends = await prepare();
+      render();
+      sendRound(0);
+    } catch (e) {
+      sends = null;
+      showError('Could not prepare the files: ' + (e?.message || e));
+      btn.disabled = false; btn.textContent = 'Try again';
+    }
+  };
+
+  $('file').onchange = e => { addFiles([...e.target.files]); e.target.value = ''; };
+  $('shrink').onchange = render;
+  const drop = document.querySelector('.drop');
+  drop.ondragover = e => { e.preventDefault(); drop.classList.add('over'); };
+  drop.ondragleave = () => drop.classList.remove('over');
+  drop.ondrop = e => { e.preventDefault(); drop.classList.remove('over'); addFiles([...e.dataTransfer.files]); };
+</script>
+</body>
+</html>
